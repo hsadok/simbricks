@@ -181,6 +181,47 @@ class NICSim(PCIDevSim):
         return super().sockets_wait(env) + [env.nic_eth_path(self)]
 
 
+class PCISwitchSim(PCIDevSim):
+    """Base class for PCIe switch simulators."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.downstream: tp.List[PCIDevSim] = []
+
+    def basic_args(self, env: ExpEnv, extra: tp.Optional[str] = None) -> str:
+        cmd = f'{env.dev_pci_path(self)}'
+        if extra is not None:
+            cmd += ' ' + extra
+        return cmd
+
+    def basic_run_cmd(
+        self, env: ExpEnv, name: str, extra: tp.Optional[str] = None
+    ) -> str:
+        cmd = f'{env.repodir}/sims/pcie_switch/{name} {self.basic_args(env, extra)}'
+        return cmd
+
+    def add_nic(self, dev: NICSim) -> None:
+        """Add a NIC to this PCIe switch."""
+        self.add_pcidev(dev)
+
+    def add_pcidev(self, dev: PCIDevSim) -> None:
+        """Add a PCIe device to this PCIe switch."""
+        dev.name = self.name + '.' + dev.name
+        self.downstream.append(dev)
+
+    def full_name(self) -> str:
+        return 'pcisw.' + self.name
+
+    def is_nic(self) -> bool:
+        return True
+
+    def sockets_cleanup(self, env: ExpEnv) -> tp.List[str]:
+        return super().sockets_cleanup(env)
+
+    def sockets_wait(self, env: ExpEnv) -> tp.List[str]:
+        return super().sockets_wait(env)
+
+
 class NetSim(Simulator):
     """Base class for network simulators."""
 
@@ -360,10 +401,19 @@ class HostSim(Simulator):
 
     def dependencies(self) -> tp.List[PCIDevSim]:
         deps = []
-        for dev in self.pcidevs:
-            deps.append(dev)
+
+        def process_dev_dependencies(dev: PCIDevSim) -> tp.List[PCIDevSim]:
+            deps = []
+            if isinstance(dev, PCISwitchSim):
+                for sub_dev in dev.downstream:
+                    deps += process_dev_dependencies(sub_dev)
             if isinstance(dev, NICSim):
                 deps.append(dev.network)
+            deps.append(dev)
+            return deps
+
+        for dev in self.pcidevs:
+            deps += process_dev_dependencies(dev)
         for dev in self.memdevs:
             deps.append(dev)
         return deps
@@ -429,15 +479,72 @@ class QemuHost(HostSim):
 
             cmd += f' -icount shift={shift},sleep=off '
 
-        for dev in self.pcidevs:
-            cmd += f'-device simbricks-pci,socket={env.dev_pci_path(dev)}'
-            if self.sync:
-                cmd += ',sync=on'
-                cmd += f',pci-latency={self.pci_latency}'
-                cmd += f',sync-period={self.sync_period}'
+        root_port_cnt = 0
+        chassis_cnt = 1
+        addr_cnt = 5
+        upstream_port_cnt = 1
+        downstream_port_cnt = 1
+
+        def device_cmd(dev: PCIDevSim, bus: tp.Optional[str] = None) -> str:
+            nonlocal root_port_cnt
+            nonlocal chassis_cnt
+            nonlocal addr_cnt
+            nonlocal upstream_port_cnt
+            nonlocal downstream_port_cnt
+
+            cmd = ''
+            if isinstance(dev, PCISwitchSim):
+                if bus is None:  # Add root port
+                    rp_id = f'rp{root_port_cnt}'
+                    addr = f'{addr_cnt}.0'
+                    cmd += (
+                        '-device pcie-root-port,'
+                        f'id={rp_id},'
+                        'bus=pcie.0,'
+                        f'chassis={chassis_cnt},'
+                        f'addr={addr},multifunction=on,pref64-reserve=32M '
+                    )
+                    root_port_cnt += 1
+                    chassis_cnt += 1
+                    addr_cnt += 1
+                    bus = rp_id
+
+                cmd += (
+                    '-device x3130-upstream,'
+                    f'id=upstream_port{upstream_port_cnt},'
+                    f'bus={bus} '
+                )
+                for i, sub_dev in enumerate(dev.downstream):
+                    dev_id = f'downstream_port{downstream_port_cnt}'
+                    cmd += (
+                        '-device xio3130-downstream,'
+                        f'id={dev_id},'
+                        f'bus=upstream_port{upstream_port_cnt},'
+                        'chassis=0,'
+                        f'slot={i} '
+                    )
+                    downstream_port_cnt += 1
+                    cmd += device_cmd(sub_dev, dev_id)
+
+                upstream_port_cnt += 1
+
             else:
-                cmd += ',sync=off'
-            cmd += ' '
+                cmd += f'-device simbricks-pci,socket={env.dev_pci_path(dev)}'
+                if bus is not None:
+                    cmd += f',bus={bus}'
+
+                if self.sync:
+                    cmd += ',sync=on'
+                    cmd += f',pci-latency={self.pci_latency}'
+                    cmd += f',sync-period={self.sync_period}'
+                else:
+                    cmd += ',sync=off'
+                cmd += ' '
+
+            return cmd
+
+        for dev in self.pcidevs:
+            cmd += device_cmd(dev)
 
         # qemu does not currently support net direct ports
         assert len(self.net_directs) == 0

@@ -341,7 +341,6 @@ class EnsoNode(NodeConfig):
     def __init__(self) -> None:
         super().__init__()
         self.disk_image = 'enso'
-        self.pci_dev = '0000:00:02.0'
         self.memory = 16 * 1024
         self.enso_parent_dir = '/root'
         self.local_enso_dir: tp.Optional[str] = None
@@ -862,6 +861,7 @@ class EnsoGen(AppConfig):
         self.pcap = '{node.enso_dir}/scripts/sample_pcaps/2_64_1_2.pcap'
         self.count = 10
         self.rate = 100  # Gbps
+        self.pcie_dev: tp.Optional[str] = None
 
     def run_cmds(self, node: NodeConfig) -> tp.List[str]:
         if not isinstance(node, EnsoNode):
@@ -872,8 +872,10 @@ class EnsoGen(AppConfig):
         cmd = (
             f'sudo ./scripts/ensogen.sh {pcap_path} {self.rate} '
             f'--count {self.count} '
-            f'--pcie-addr {node.pci_dev} '
         )
+
+        if self.pcie_dev is not None:
+            cmd += f'--pcie-addr {self.pcie_dev} '
 
         return [
             f'cd {node.enso_dir}',
